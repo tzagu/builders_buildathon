@@ -1,0 +1,26 @@
+[package]
+name = "sessions"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+memchr = "2"
+memmap2 = "0.9"
+rayon = "1"
+parquet = { version = "53", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+# Quick local iteration only; the image uses `release`.
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
