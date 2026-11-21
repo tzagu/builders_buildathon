@@ -11,6 +11,10 @@ memmap2 = "0.9"
 rayon = "1"
 parquet = { version = "53", default-features = false }
 libc = "0.2"
+pprof = { version = "0.13", optional = true }
+
+[features]
+prof = ["dep:pprof"]
 
 [profile.release]
 opt-level = 3

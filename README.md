@@ -42,7 +42,9 @@ docker build -t shopping-sessions .
 
 - Open-source libraries: [rayon](https://crates.io/crates/rayon),
   [memchr](https://crates.io/crates/memchr), [memmap2](https://crates.io/crates/memmap2),
-  [parquet](https://crates.io/crates/parquet) (Apache Arrow).
+  [parquet](https://crates.io/crates/parquet) (Apache Arrow), [libc](https://crates.io/crates/libc);
+  [pprof](https://crates.io/crates/pprof) only behind the optional `prof` feature for
+  local profiling (not built into the image).
 - No code written before the weekend. Built with AI assistance (Claude), as the track
   allows.
 - MIT License (see `LICENSE`), as the Buildathon requires.

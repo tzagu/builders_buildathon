@@ -354,6 +354,30 @@ impl Lookup {
     }
 }
 
+/// A zero-filled Vec of `n` items; at 4 MiB and up it is 2 MiB-aligned and advised to
+/// use transparent huge pages before it is first touched. T must be valid as all zeros.
+fn huge_zeroed<T: Copy>(n: usize) -> Vec<T> {
+    let bytes = n * std::mem::size_of::<T>();
+    const HP: usize = 2 << 20;
+    unsafe {
+        if bytes < 2 * HP {
+            let mut v = Vec::with_capacity(n);
+            std::ptr::write_bytes(v.as_mut_ptr(), 0, n);
+            v.set_len(n);
+            return v;
+        }
+        let layout = std::alloc::Layout::from_size_align(bytes, HP).unwrap();
+        let p = std::alloc::alloc(layout) as *mut T;
+        if p.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        libc::madvise(p as *mut libc::c_void, bytes & !(HP - 1), libc::MADV_HUGEPAGE);
+        std::ptr::write_bytes(p, 0, n);
+        // glibc's free() accepts aligned blocks, so dropping this Vec is fine.
+        Vec::from_raw_parts(p, n, n)
+    }
+}
+
 /// Open-addressing table keyed by a nonzero Id, one 32-byte slot per entry (never split
 /// across cache lines), with prefetch so lookups overlap their memory latency.
 #[derive(Clone, Copy)]
@@ -371,6 +395,12 @@ impl<V: Copy + Default> Table<V> {
     fn new(n: usize) -> Self {
         let cap = (n * 2).next_power_of_two().max(16);
         Table { mask: cap - 1, slots: vec![Slot { k: 0, v: V::default() }; cap], len: 0 }
+    }
+    /// Like `new`, but a big table lives on 2 MiB huge pages (2 MiB-aligned, advised
+    /// before first touch): random probes then miss the TLB far less often.
+    fn new_huge(n: usize) -> Self {
+        let cap = (n * 2).next_power_of_two().max(16);
+        Table { mask: cap - 1, slots: huge_zeroed::<Slot<V>>(cap), len: 0 }
     }
     /// Empties the table for about `n` keys, reusing its buffer when it is big enough.
     fn reset(&mut self, n: usize) {
@@ -581,19 +611,20 @@ fn parse_ts(b: &[u8]) -> Option<i64> {
 
 /// Per-thread memo of validated dates ("YYYY-MM-DD" → days): a window spans ~3 weeks.
 struct Dates {
-    a: [u64; 64],
-    dd: [u16; 64],
-    days: [i32; 64],
+    a: [u64; 256],
+    dd: [u16; 256],
+    days: [i32; 256],
 }
 impl Dates {
     fn new() -> Self {
-        Dates { a: [0; 64], dd: [0; 64], days: [0; 64] }
+        Dates { a: [0; 256], dd: [0; 256], days: [0; 256] }
     }
     #[inline(always)]
     fn days(&mut self, b: &[u8]) -> Option<i64> {
         let a = u64::from_le_bytes(b[0..8].try_into().unwrap());
         let dd = u16::from_le_bytes([b[8], b[9]]);
-        let i = (((a >> 40) as usize) ^ ((dd as usize) * 7)) & 63;
+        // Multiplicative hash of all ten date bytes (the old index only saw the day's tens digit).
+        let i = ((a ^ (dd as u64) << 3).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as usize;
         if self.a[i] == a && self.dd[i] == dd {
             return Some(self.days[i] as i64);
         }
@@ -784,11 +815,13 @@ struct Persons {
 
 impl Persons {
     fn new(remap: &[(Id, Id)]) -> Self {
-        let mut table: Table<Id> = Table::new(remap.len());
+        let mut table: Table<Id> = Table::new_huge(remap.len());
         for &(id, p) in remap {
             *table.slot(id).0 = p;
         }
-        Persons { table, any: !remap.is_empty() }
+        // SS_NOLINK=1: timing experiments only (ignores links, so output is wrong).
+        let any = !remap.is_empty() && std::env::var("SS_NOLINK").is_err();
+        Persons { table, any }
     }
     #[inline(always)]
     fn of(&self, u: Id) -> Id {
@@ -827,10 +860,15 @@ fn parse_events(chunk: &[u8], ctx: &Ctx) -> Buckets<Ev> {
             if ts < ctx.ws || ts >= ctx.we {
                 break 'valid;
             }
-            let kind = match f[4] {
-                b"view" => 1,
-                b"cart" => 2,
-                b"purchase" => 3,
+            // Integer compares instead of memcmp calls.
+            let t = f[4];
+            let kind = match t.len() {
+                4 => match u32::from_le_bytes(t.try_into().unwrap()) {
+                    0x7765_6976 => 1, // "view"
+                    0x7472_6163 => 2, // "cart"
+                    _ => break 'valid,
+                },
+                8 if u64::from_le_bytes(t.try_into().unwrap()) == u64::from_le_bytes(*b"purchase") => 3,
                 _ => break 'valid,
             };
             let price = if kind == 3 {
@@ -916,7 +954,7 @@ fn parse_links(chunk: &[u8]) -> Vec<(Id, Id)> {
 /// Union-find over links. Returns id → person (smallest ID of its component), only for
 /// IDs whose person is not themselves.
 fn build_persons(pairs: &[(Id, Id)]) -> Vec<(Id, Id)> {
-    let mut index: Table<u32> = Table::new(pairs.len() * 2);
+    let mut index: Table<u32> = Table::new_huge(pairs.len() * 2);
     let mut ids: Vec<Id> = Vec::with_capacity(pairs.len() * 2);
     let mut parent: Vec<u32> = Vec::with_capacity(pairs.len() * 2);
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
@@ -1242,7 +1280,8 @@ fn prefix(count: &[u32]) -> Vec<u32> {
 fn props(no_dict: &[&str]) -> Arc<WriterProperties> {
     let mut b = WriterProperties::builder()
         .set_compression(Compression::UNCOMPRESSED)
-        .set_statistics_enabled(EnabledStatistics::None);
+        .set_statistics_enabled(EnabledStatistics::None)
+        .set_dictionary_enabled(false);
     for c in no_dict {
         b = b.set_column_dictionary_enabled(ColumnPath::from(*c), false);
     }
@@ -1348,6 +1387,8 @@ fn write_campaign(path: &Path, rows: &[CRow]) -> parquet::errors::Result<()> {
 
 fn main() {
     let t0 = Instant::now();
+    #[cfg(feature = "prof")]
+    let guard = pprof::ProfilerGuardBuilder::default().frequency(2000).build().unwrap();
     // Keep big freed blocks in malloc's heaps (up to 32 MiB per block) so later stages
     // reuse memory that is already faulted in, instead of mapping fresh pages.
     unsafe {
@@ -1564,6 +1605,23 @@ fn main() {
         || write_campaign(&cd.join("part-0000.parquet"), &crow).expect("write campaign_daily"),
     );
     lap(&format!("wrote output ({} campaign_daily rows)", crow.len()));
+    #[cfg(feature = "prof")]
+    {
+        // Local profiling only (cargo build --features prof): self time by function.
+        let report = guard.report().build().unwrap();
+        let mut by_fn: HashMap<String, isize> = HashMap::new();
+        let mut total = 0isize;
+        for (frames, n) in report.data.iter() {
+            total += *n;
+            let leaf = frames.frames.first().and_then(|f| f.first()).map(|s| s.name()).unwrap_or_default();
+            *by_fn.entry(leaf).or_default() += *n;
+        }
+        let mut v: Vec<_> = by_fn.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        for (name, n) in v.iter().take(30) {
+            eprintln!("{:5.1}%  {}", 100.0 * *n as f64 / total as f64, name);
+        }
+    }
     std::process::exit(0);
 }
 
