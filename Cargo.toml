@@ -10,6 +10,7 @@ memchr = "2"
 memmap2 = "0.9"
 rayon = "1"
 parquet = { version = "53", default-features = false }
+libc = "0.2"
 
 [profile.release]
 opt-level = 3
