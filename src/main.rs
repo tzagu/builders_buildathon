@@ -258,7 +258,7 @@ struct Buckets<T: Copy> {
 impl<T: Copy> Buckets<T> {
     fn new(expected_total: usize) -> Self {
         let cap = expected_total / NB * 9 / 8 + 48;
-        Buckets { data: Vec::with_capacity(cap * NB), cap, lens: vec![0; NB], spill: (0..NB).map(|_| Vec::new()).collect() }
+        Buckets { data: huge_vec(cap * NB), cap, lens: vec![0; NB], spill: (0..NB).map(|_| Vec::new()).collect() }
     }
     #[inline(always)]
     fn push(&mut self, b: usize, v: T) {
@@ -375,6 +375,35 @@ fn huge_zeroed<T: Copy>(n: usize) -> Vec<T> {
         std::ptr::write_bytes(p, 0, n);
         // glibc's free() accepts aligned blocks, so dropping this Vec is fine.
         Vec::from_raw_parts(p, n, n)
+    }
+}
+
+/// An empty Vec with room for `n` items; at 4 MiB and up it is 2 MiB-aligned and
+/// advised to use transparent huge pages before it is first touched (fewer page
+/// faults and TLB misses; both cost more on a VM).
+fn huge_vec<T>(n: usize) -> Vec<T> {
+    let bytes = n * std::mem::size_of::<T>();
+    const HP: usize = 2 << 20;
+    if bytes < 2 * HP {
+        return Vec::with_capacity(n);
+    }
+    unsafe {
+        let layout = std::alloc::Layout::from_size_align(bytes, HP).unwrap();
+        let p = std::alloc::alloc(layout) as *mut T;
+        if p.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        libc::madvise(p as *mut libc::c_void, bytes & !(HP - 1), libc::MADV_HUGEPAGE);
+        // glibc's free()/realloc() accept aligned blocks, so the Vec may drop or grow.
+        Vec::from_raw_parts(p, 0, n)
+    }
+}
+
+/// Clears `v` and makes room for `n` items, on huge pages when it has to grow.
+fn ensure<T>(v: &mut Vec<T>, n: usize) {
+    v.clear();
+    if v.capacity() < n {
+        *v = huge_vec(n + n / 8);
     }
 }
 
@@ -895,7 +924,7 @@ fn parse_events(chunk: &[u8], ctx: &Ctx) -> Buckets<Ev> {
 
 /// Valid clicks of one chunk, `person` still holding the raw user ID.
 fn parse_clicks(chunk: &[u8], ctx: &Ctx) -> Vec<CRec> {
-    let mut out = Vec::with_capacity(chunk.len() / 45);
+    let mut out = huge_vec(chunk.len() / 45);
     let end = chunk.as_ptr() as usize + chunk.len();
     let lo = ctx.ws - WEEK;
     let mut dates = Dates::new();
@@ -1184,8 +1213,7 @@ fn process_bucket(srecs: &[&[SRec]], clicks: &[&[CRec]], acc: &mut Acc, ctx: &Ct
     tab.reset(n / 4 + 64);
     persons.clear();
     count.clear();
-    idx.clear();
-    idx.reserve(n);
+    ensure(idx, n);
     for b in srecs {
         for r in b.iter() {
             let (v, new) = tab.slot_grow(r.person);
@@ -1202,8 +1230,7 @@ fn process_bucket(srecs: &[&[SRec]], clicks: &[&[CRec]], acc: &mut Acc, ctx: &Ct
     let np = persons.len();
     let start = prefix(count);
     let mut pos: Vec<u32> = start[..np].to_vec();
-    ev.clear();
-    ev.reserve(n);
+    ensure(ev, n);
     unsafe {
         let base = ev.as_mut_ptr();
         let mut k = 0;
@@ -1218,8 +1245,7 @@ fn process_bucket(srecs: &[&[SRec]], clicks: &[&[CRec]], acc: &mut Acc, ctx: &Ct
         ev.set_len(n);
     }
     // Clicks of persons with sessions in this bucket (no one else can be credited).
-    cidx.clear();
-    cidx.reserve(clicks.iter().map(|v| v.len()).sum());
+    ensure(cidx, clicks.iter().map(|v| v.len()).sum());
     let mut ccount = vec![0u32; np];
     for b in clicks {
         for c in b.iter() {
@@ -1233,8 +1259,7 @@ fn process_bucket(srecs: &[&[SRec]], clicks: &[&[CRec]], acc: &mut Acc, ctx: &Ct
     let cstart = prefix(&ccount);
     let nc = cstart[np] as usize;
     let mut cpos: Vec<u32> = cstart[..np].to_vec();
-    cl.clear();
-    cl.reserve(nc);
+    ensure(cl, nc);
     unsafe {
         let base = cl.as_mut_ptr();
         let mut k = 0;
@@ -1486,7 +1511,7 @@ fn main() {
             let total: usize = cols.iter().map(|v| v.len()).sum();
             let cap = (total * 3 / 2).next_power_of_two().max(16);
             let mask = cap - 1;
-            slots.clear();
+            ensure(slots, cap);
             slots.resize(cap, 0);
             dead.clear();
             dead.resize(total / 64 + 1, 0);
