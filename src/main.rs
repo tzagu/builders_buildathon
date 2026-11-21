@@ -1409,21 +1409,22 @@ fn main() {
 
     // Events need no persons to parse, so links (union-find is sequential) and then
     // clicks run while the rest of the pool parses events.
-    let ((persons, raw_clicks), parsed): ((Persons, Vec<Vec<CRec>>), Vec<Buckets<Ev>>) = rayon::join(
-        || {
-            rayon::join(
-                || {
-                    let pairs: Vec<(Id, Id)> = link_chunks.par_iter().flat_map_iter(|c| parse_links(c)).collect();
-                    let remap = build_persons(&pairs);
-                    lap(&format!("links: {} ids remapped", remap.len()));
-                    Persons::new(&remap)
-                },
-                || cl_chunks.par_iter().map(|c| parse_clicks(c, &ctx)).collect(),
-            )
-        },
+    // Links (union-find is sequential) get their own thread, hidden behind the parse.
+    let links = std::thread::spawn(move || {
+        let mut pairs: Vec<(Id, Id)> = Vec::new();
+        for c in &link_chunks {
+            pairs.extend(parse_links(c));
+        }
+        let remap = build_persons(&pairs);
+        (Persons::new(&remap), remap.len())
+    });
+    let (raw_clicks, parsed): (Vec<Vec<CRec>>, Vec<Buckets<Ev>>) = rayon::join(
+        || cl_chunks.par_iter().map(|c| parse_clicks(c, &ctx)).collect(),
         || ev_chunks.par_iter().map(|c| parse_events(c, &ctx)).collect(),
     );
     lap("parsed events and clicks");
+    let (persons, nremap) = links.join().expect("links thread");
+    lap(&format!("links: {nremap} ids remapped"));
     let clicks: Vec<Buckets<CRec>> = raw_clicks.into_par_iter().map(|v| bucket_clicks(v, &persons)).collect();
 
     // Dedup on event_id: keep the copy with the smallest ingest_ts, then keep it only
@@ -1432,31 +1433,62 @@ fn main() {
         .into_par_iter()
         .map(|b| {
             thread_local! {
-                static TABLES: std::cell::RefCell<(Table<(i64, u32)>, Vec<u64>)> =
-                    std::cell::RefCell::new((Table::new(0), Vec::new()));
+                static TABLES: std::cell::RefCell<(Vec<u64>, Vec<u64>)> =
+                    const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
             }
-            TABLES.with_borrow_mut(|(best, dead)| {
+            TABLES.with_borrow_mut(|(slots, dead)| {
             let cols = column(&parsed, b);
-            // One probe per copy: the table holds the best copy so far; a beaten copy is
-            // marked dead. Equal ingest_ts: copies are identical, the first stays.
+            // One probe per copy into a compact table of (32-bit fingerprint, copy index)
+            // slots (fits in L2). The full event_id is compared only on a fingerprint
+            // match. The table holds the best copy so far; a beaten copy is marked dead.
+            // Equal ingest_ts: copies are identical, the first stays.
             let total: usize = cols.iter().map(|v| v.len()).sum();
-            best.reset(total);
+            let cap = (total * 3 / 2).next_power_of_two().max(16);
+            let mask = cap - 1;
+            slots.clear();
+            slots.resize(cap, 0);
             dead.clear();
             dead.resize(total / 64 + 1, 0);
+            let starts: Vec<u32> = {
+                let mut v = Vec::with_capacity(cols.len() + 1);
+                let mut acc = 0u32;
+                for c in &cols {
+                    v.push(acc);
+                    acc += c.len() as u32;
+                }
+                v.push(acc);
+                v
+            };
+            let rec = |g: u32| -> &Ev {
+                let c = starts.partition_point(|&s| s <= g) - 1;
+                &cols[c][(g - starts[c]) as usize]
+            };
             let mut g = 0u32;
             for v in &cols {
-                for (i, ev) in v.iter().enumerate() {
-                    if let Some(next) = v.get(i + LAG) {
-                        best.prefetch(j2(next.eid));
-                    }
-                    let (slot, new) = best.slot(j2(ev.eid));
-                    if new {
-                        *slot = (ev.ingest, g);
-                    } else if ev.ingest < slot.0 {
-                        dead[(slot.1 / 64) as usize] |= 1 << (slot.1 % 64);
-                        *slot = (ev.ingest, g);
-                    } else {
-                        dead[(g / 64) as usize] |= 1 << (g % 64);
+                for ev in v.iter() {
+                    let h = hid(j2(ev.eid));
+                    let fp = ((h >> 32) as u32 | 1) as u64;
+                    let mut k = h as usize & mask;
+                    loop {
+                        let sl = unsafe { *slots.get_unchecked(k) };
+                        if sl == 0 {
+                            unsafe { *slots.get_unchecked_mut(k) = fp << 32 | g as u64 };
+                            break;
+                        }
+                        if sl >> 32 == fp {
+                            let og = sl as u32;
+                            let o = rec(og);
+                            if o.eid == ev.eid {
+                                if ev.ingest < o.ingest {
+                                    dead[(og / 64) as usize] |= 1 << (og % 64);
+                                    slots[k] = fp << 32 | g as u64;
+                                } else {
+                                    dead[(g / 64) as usize] |= 1 << (g % 64);
+                                }
+                                break;
+                            }
+                        }
+                        k = (k + 1) & mask;
                     }
                     g += 1;
                 }
